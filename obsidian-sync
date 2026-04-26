@@ -21,8 +21,11 @@ COMMANDS
                 on confirm.
   status        Show differences for each configured source.
   pull          Sync Obsidian -> local for each source (rsync --delete).
+  git-pull      git pull the Obsidian vault repo, then sync vault -> local.
+                Use this instead of pull when the vault is a git repo shared
+                across machines — ensures vault is up to date before rsyncing.
   push          Sync local -> Obsidian for each source (rsync --delete).
-  commit        Pull all sources from Obsidian, then git commit + push BOTH
+  git-commit    Pull all sources from Obsidian, then git commit + push BOTH
                 the local repo and the Obsidian repo.
   help, -h, --help
                 Show this help.
@@ -402,6 +405,21 @@ case "$1" in
             rsync -avz --delete "$OBSIDIAN_DIR" "$LOCAL_DIR"
         done
         ;;
+    git-pull)
+        OBSIDIAN_REPO=$(dirname "$OBSIDIAN_BASE")
+        if [ ! -d "$OBSIDIAN_REPO/.git" ]; then
+            echo "Error: Obsidian repository .git not found at $OBSIDIAN_REPO"
+            exit 1
+        fi
+        echo "Pulling latest changes from Obsidian git repo..."
+        (cd "$OBSIDIAN_REPO" && git pull --rebase)
+        for src in "${SYNC_SRCS[@]}"; do
+            build_paths "$src"
+            mkdir -p "$OBSIDIAN_DIR"
+            echo "Syncing $PROJECT_NAME [${src:-root}]: Obsidian -> Local..."
+            rsync -avz --delete "$OBSIDIAN_DIR" "$LOCAL_DIR"
+        done
+        ;;
     push)
         for src in "${SYNC_SRCS[@]}"; do
             build_paths "$src"
@@ -410,7 +428,7 @@ case "$1" in
             rsync -avz --delete "$LOCAL_DIR" "$OBSIDIAN_DIR"
         done
         ;;
-    commit)
+    git-commit)
         echo "--- Obsidian Sync & Git Commit ---"
         echo "Step 1: Pulling latest changes from Obsidian..."
         for src in "${SYNC_SRCS[@]}"; do

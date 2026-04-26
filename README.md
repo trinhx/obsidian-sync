@@ -10,7 +10,7 @@ Useful for keeping working files (notes, drafts, attachments, etc.) inside your 
 | ----------------------------------- | ------------------------------------------------------------------ |
 | `bash` 4+                           | The script uses bash arrays and `read -e -i`.                      |
 | `rsync`                             | Does the actual mirroring.                                         |
-| `git`                               | Only needed for `obsidian-sync commit`. Optional otherwise.        |
+| `git`                               | Needed for `git-pull` and `git-commit`. Optional otherwise.            |
 | [Obsidian](https://obsidian.md)     | A vault somewhere under `$HOME` (any folder containing `.obsidian/`). |
 
 Install the dependencies if you don't already have them:
@@ -96,12 +96,13 @@ On first run, `obsidian-sync` scans `$HOME` for Obsidian vaults (directories con
 | -------- | ----------------------------------------------------------------------------- |
 | `init`   | Interactively create a `.obsidian-sync` config in the current project.        |
 | `status` | Show `diff -rq` between local and vault for each configured source.           |
-| `pull`   | Sync vault → local (`rsync --delete`).                                        |
-| `push`   | Sync local → vault (`rsync --delete`).                                        |
-| `commit` | Pull from vault, then `git commit && git push` in BOTH the project and vault. |
-| `help`   | Print usage.                                                                  |
+| `pull`       | Sync vault → local (`rsync --delete`).                                        |
+| `git-pull`   | `git pull` the vault repo, then sync vault → local. Use this instead of `pull` when your vault is a git repo synced across machines. |
+| `push`       | Sync local → vault (`rsync --delete`).                                        |
+| `git-commit`     | Pull from vault, then `git commit && git push` in BOTH the project and vault. |
+| `help`       | Print usage.                                                                  |
 
-> **Note:** `pull` and `push` use `rsync --delete` — files missing on the source side are deleted on the destination side. Run `status` first if unsure.
+> **Note:** `pull`, `git-pull`, and `push` use `rsync --delete` — files missing on the source side are deleted on the destination side. Run `status` first if unsure.
 
 ## Configuration
 
@@ -126,9 +127,20 @@ OBSIDIAN_BASE=/path/to/your/ObsidianVault/Projects
 
 This file is created on first run. Edit it to point at a different vault or a different subdirectory inside the vault.
 
-## `commit` command
+## `git-pull` command
 
-`obsidian-sync commit` is a convenience workflow for the common case where both the project and the Obsidian vault are themselves git repos:
+`obsidian-sync git-pull` is the recommended way to pull when your vault is a git repo shared across machines:
+
+1. `git pull --rebase` in the vault repo (the parent of `OBSIDIAN_BASE`).
+2. `rsync --delete` vault → local for each configured source.
+
+This ensures the vault is fully up to date from the remote before syncing to your local project. Requires the vault's parent directory to be a git repo — exits with an error otherwise.
+
+Use plain `pull` if your vault is local-only (no git remote).
+
+## `git-commit` command
+
+`obsidian-sync git-commit` is a convenience workflow for the common case where both the project and the Obsidian vault are themselves git repos:
 
 1. Pull the latest from the vault into the project (`rsync --delete`).
 2. `git add . && git commit && git push` in the project repo.
