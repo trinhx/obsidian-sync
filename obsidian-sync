@@ -1,0 +1,401 @@
+#!/bin/bash
+
+# obsidian-sync — mirror project folders to/from an Obsidian vault.
+
+DEFAULT_OBSIDIAN_BASE="/home/max/Documents/Tonys Vault/Agent-Workspace/Projects"
+CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/obsidian-sync/config"
+
+print_help() {
+    cat << 'EOF'
+obsidian-sync — mirror project folders to/from an Obsidian vault.
+
+USAGE
+  obsidian-sync <command>
+
+COMMANDS
+  init          Interactively create a .obsidian-sync config in the current
+                project. Lets you pick one or more source folders inside the
+                project (or the project root, or a custom path) and a
+                destination base inside the Obsidian vault. Each source maps
+                to <vault>/<dest_base>/<source>/. Creates destinations on
+                confirm.
+  status        Show differences for each configured source.
+  pull          Sync Obsidian -> local for each source (rsync --delete).
+  push          Sync local -> Obsidian for each source (rsync --delete).
+  commit        Pull all sources from Obsidian, then git commit + push BOTH
+                the local repo and the Obsidian repo.
+  help, -h, --help
+                Show this help.
+
+PROJECT CONFIG  (./.obsidian-sync, written by `init`)
+  SYNC_SRCS       Bash array of source folders to sync (relative to project
+                  root). An empty-string entry means the project root itself.
+                  Example: SYNC_SRCS=("drive" "tunes")
+  SYNC_DEST_BASE  Destination base in the Obsidian vault, relative to
+                  OBSIDIAN_BASE. Default: "<project-name>/".
+                  Each source maps to <OBSIDIAN_BASE>/<SYNC_DEST_BASE>/<src>/.
+
+USER CONFIG  (~/.config/obsidian-sync/config)
+  OBSIDIAN_BASE The base "Projects" directory inside your Obsidian vault.
+                Created on first run if missing — edit the file to change it.
+
+EXAMPLE
+  cd /home/max/Repos/honda-tune
+  obsidian-sync init           # pick "1,2" (drive + tunes), accept default base
+  obsidian-sync push           # mirrors honda-tune/drive/  -> <vault>/honda-tune/drive/
+                               # mirrors honda-tune/tunes/  -> <vault>/honda-tune/tunes/
+EOF
+}
+
+first_run_setup() {
+    echo "First-run setup: no $CONFIG_FILE found." >&2
+    echo "Searching for Obsidian vaults under $HOME..." >&2
+
+    local raw_vaults=()
+    local d
+    while IFS= read -r d; do
+        raw_vaults+=("$(dirname "$d")")
+    done < <(find "$HOME" -maxdepth 5 -type d -name '.obsidian' 2>/dev/null)
+
+    local vaults=()
+    if [ "${#raw_vaults[@]}" -gt 0 ]; then
+        local v
+        while IFS= read -r v; do
+            vaults+=("$v")
+        done < <(printf '%s\n' "${raw_vaults[@]}" | sort -u)
+    fi
+
+    echo
+    if [ "${#vaults[@]}" -gt 0 ]; then
+        echo "Detected Obsidian vaults:"
+        local i=1
+        for v in "${vaults[@]}"; do
+            printf "  %d) %s\n" "$i" "$v"
+            i=$((i+1))
+        done
+        echo
+
+        local input
+        while true; do
+            read -e -p "Pick a vault (1-${#vaults[@]}), 'c' for custom path, 'q' to cancel: " input
+            input="${input// /}"
+            case "$input" in
+                q|Q) echo "Aborted."; exit 1 ;;
+                c|C)
+                    read -e -i "$DEFAULT_OBSIDIAN_BASE" -p "Obsidian Projects base path: " OBSIDIAN_BASE
+                    break
+                    ;;
+                *)
+                    if [[ "$input" =~ ^[1-9][0-9]*$ ]] && [ "$input" -le "${#vaults[@]}" ]; then
+                        local vault="${vaults[$((input-1))]}"
+                        local sub
+                        read -e -i "Projects" -p "Subpath inside '$vault' for project syncs: " sub
+                        OBSIDIAN_BASE="$vault/${sub%/}"
+                        break
+                    fi
+                    echo "Invalid: '$input'"
+                    ;;
+            esac
+        done
+    else
+        echo "No vaults found. Enter the path manually."
+        read -e -i "$DEFAULT_OBSIDIAN_BASE" -p "Obsidian Projects base path: " OBSIDIAN_BASE
+    fi
+
+    if [ -z "${OBSIDIAN_BASE:-}" ]; then
+        echo "Error: empty path."
+        exit 1
+    fi
+
+    if [ ! -d "$OBSIDIAN_BASE" ]; then
+        local yn
+        read -p "Directory '$OBSIDIAN_BASE' does not exist. Create it? [Y/n] " yn
+        case "$yn" in
+            [Nn]*) echo "Aborted."; exit 1 ;;
+            *) mkdir -p "$OBSIDIAN_BASE" || { echo "Failed to create directory."; exit 1; } ;;
+        esac
+    fi
+    mkdir -p "$(dirname "$CONFIG_FILE")"
+    printf 'OBSIDIAN_BASE=%q\n' "$OBSIDIAN_BASE" > "$CONFIG_FILE"
+    echo "Wrote $CONFIG_FILE"
+}
+
+load_config() {
+    if [ -f "$CONFIG_FILE" ]; then
+        # shellcheck disable=SC1090
+        source "$CONFIG_FILE"
+    fi
+    if [ -z "${OBSIDIAN_BASE:-}" ]; then
+        first_run_setup
+    fi
+}
+
+# Compose absolute LOCAL_DIR / OBSIDIAN_DIR for a given source entry.
+# Sets globals LOCAL_DIR and OBSIDIAN_DIR.
+build_paths() {
+    local src="$1"
+    LOCAL_DIR=$(echo "$PWD/${src%/}/" | sed 's://*:/:g')
+    OBSIDIAN_DIR=$(echo "$OBSIDIAN_BASE/${SYNC_DEST_BASE%/}/${src%/}/" | sed 's://*:/:g')
+}
+
+do_init() {
+    if [ -f ".obsidian-sync" ]; then
+        echo "Error: .obsidian-sync already exists in this directory."
+        exit 1
+    fi
+
+    local PROJECT_NAME
+    PROJECT_NAME=$(basename "$PWD")
+
+    # --- Discover subdirs ---
+    local subdirs=()
+    local d
+    while IFS= read -r d; do
+        subdirs+=("$d")
+    done < <(find . -maxdepth 1 -mindepth 1 -type d -not -name '.*' -printf '%f\n' | sort)
+
+    # --- Pick SYNC_SRCS (multi-select) ---
+    echo
+    echo "Select folder(s) inside '$PROJECT_NAME' to sync:"
+    if [ "${#subdirs[@]}" -eq 0 ]; then
+        echo "  (no subdirectories found)"
+    else
+        local i=1
+        for d in "${subdirs[@]}"; do
+            printf "  %d) %s/\n" "$i" "$d"
+            i=$((i+1))
+        done
+    fi
+    echo
+
+    local SYNC_SRCS=()
+    while true; do
+        local input
+        read -e -p "Numbers (e.g. 1,3), 'a' for all, 'r' for project root, 'c' for custom path, 'q' to cancel: " input
+        input="${input// /}"
+        case "$input" in
+            q|Q) echo "Aborted."; exit 1 ;;
+            r|R) SYNC_SRCS=(""); break ;;
+            a|A)
+                if [ "${#subdirs[@]}" -eq 0 ]; then
+                    echo "No subdirectories to select."
+                    continue
+                fi
+                SYNC_SRCS=("${subdirs[@]}")
+                break
+                ;;
+            c|C)
+                local custom
+                read -e -p "Custom path (relative to project root): " custom
+                SYNC_SRCS=("${custom%/}")
+                break
+                ;;
+            "") echo "Please enter a selection." ;;
+            *)
+                local invalid=0
+                local nums
+                IFS=',' read -ra nums <<< "$input"
+                local picked=()
+                local n
+                for n in "${nums[@]}"; do
+                    if ! [[ "$n" =~ ^[1-9][0-9]*$ ]] || [ "$n" -gt "${#subdirs[@]}" ]; then
+                        echo "Invalid: '$n'"
+                        invalid=1
+                        break
+                    fi
+                    picked+=("${subdirs[$((n-1))]}")
+                done
+                if [ "$invalid" -eq 0 ] && [ "${#picked[@]}" -gt 0 ]; then
+                    SYNC_SRCS=("${picked[@]}")
+                    break
+                fi
+                ;;
+        esac
+    done
+
+    # --- Pick SYNC_DEST_BASE ---
+    echo
+    local default_dest="$PROJECT_NAME/"
+    local SYNC_DEST_BASE
+    read -e -i "$default_dest" -p "Destination base in vault (relative to $OBSIDIAN_BASE): " SYNC_DEST_BASE
+    if [ -z "$SYNC_DEST_BASE" ]; then
+        SYNC_DEST_BASE="$default_dest"
+    fi
+
+    # --- Confirm + create destinations ---
+    echo
+    echo "Will sync:"
+    local src abs_src abs_dest
+    for src in "${SYNC_SRCS[@]}"; do
+        build_paths "$src"
+        abs_src="$LOCAL_DIR"
+        abs_dest="$OBSIDIAN_DIR"
+        echo "  ${abs_src}"
+        echo "    -> ${abs_dest}"
+    done
+    echo
+    local yn
+    read -p "Proceed? [Y/n] " yn
+    case "$yn" in
+        [Nn]*) echo "Aborted."; exit 1 ;;
+    esac
+
+    for src in "${SYNC_SRCS[@]}"; do
+        build_paths "$src"
+        mkdir -p "$OBSIDIAN_DIR"
+    done
+
+    {
+        echo "# obsidian-sync project config — generated $(date +'%Y-%m-%d')"
+        echo
+        echo "# Source folders to sync (relative to project root)."
+        echo "# An empty-string entry means the project root itself."
+        printf 'SYNC_SRCS=('
+        local first=1
+        for src in "${SYNC_SRCS[@]}"; do
+            if [ $first -eq 1 ]; then first=0; else printf ' '; fi
+            printf '%q' "$src"
+        done
+        printf ')\n'
+        echo
+        echo "# Destination base in the Obsidian vault (relative to OBSIDIAN_BASE)."
+        echo "# Each SYNC_SRCS entry maps to <OBSIDIAN_BASE>/<SYNC_DEST_BASE>/<src>/"
+        printf 'SYNC_DEST_BASE=%q\n' "$SYNC_DEST_BASE"
+    } > .obsidian-sync
+
+    echo "Wrote .obsidian-sync. Try: obsidian-sync push"
+}
+
+# --- Dispatch ---
+
+# Help / no-args: don't require config.
+case "${1:-}" in
+    help|-h|--help)
+        print_help
+        exit 0
+        ;;
+    "")
+        print_help
+        exit 1
+        ;;
+esac
+
+load_config
+
+if [ "$1" == "init" ]; then
+    do_init
+    exit 0
+fi
+
+if [ ! -f ".obsidian-sync" ]; then
+    echo "Error: No .obsidian-sync file found in the current directory."
+    echo "Run 'obsidian-sync init' to create a configuration file."
+    exit 1
+fi
+
+# shellcheck disable=SC1091
+source .obsidian-sync
+
+if ! declare -p SYNC_SRCS &>/dev/null; then
+    if [ -n "${SYNC_SRC+x}" ] || [ -n "${SYNC_DEST+x}" ]; then
+        echo "Error: this .obsidian-sync uses the old single-source format."
+        echo "Re-run 'obsidian-sync init' to migrate to the new multi-source format."
+    else
+        echo "Error: SYNC_SRCS not defined in .obsidian-sync."
+        echo "Re-run 'obsidian-sync init'."
+    fi
+    exit 1
+fi
+
+if [ -z "${SYNC_DEST_BASE:-}" ]; then
+    echo "Error: SYNC_DEST_BASE is empty in .obsidian-sync."
+    echo "Set it to the destination base inside the Obsidian vault (e.g. \"$(basename "$PWD")/\")."
+    exit 1
+fi
+
+if [ "${#SYNC_SRCS[@]}" -eq 0 ]; then
+    echo "Error: SYNC_SRCS is empty in .obsidian-sync. Re-run 'obsidian-sync init'."
+    exit 1
+fi
+
+PROJECT_NAME=$(basename "$PWD")
+
+case "$1" in
+    status)
+        echo "Differences for $PROJECT_NAME:"
+        for src in "${SYNC_SRCS[@]}"; do
+            build_paths "$src"
+            echo "--- ${src:-(root)} ---"
+            diff -rq "$LOCAL_DIR" "$OBSIDIAN_DIR" | grep -v "common"
+        done
+        ;;
+    pull)
+        for src in "${SYNC_SRCS[@]}"; do
+            build_paths "$src"
+            mkdir -p "$OBSIDIAN_DIR"
+            echo "Syncing $PROJECT_NAME [${src:-root}]: Obsidian -> Local..."
+            rsync -avz --delete "$OBSIDIAN_DIR" "$LOCAL_DIR"
+        done
+        ;;
+    push)
+        for src in "${SYNC_SRCS[@]}"; do
+            build_paths "$src"
+            mkdir -p "$OBSIDIAN_DIR"
+            echo "Syncing $PROJECT_NAME [${src:-root}]: Local -> Obsidian..."
+            rsync -avz --delete "$LOCAL_DIR" "$OBSIDIAN_DIR"
+        done
+        ;;
+    commit)
+        echo "--- Obsidian Sync & Git Commit ---"
+        echo "Step 1: Pulling latest changes from Obsidian..."
+        for src in "${SYNC_SRCS[@]}"; do
+            build_paths "$src"
+            mkdir -p "$OBSIDIAN_DIR"
+            echo "  [${src:-root}]"
+            rsync -avz --delete "$OBSIDIAN_DIR" "$LOCAL_DIR"
+        done
+
+        echo "Step 2: Committing and Pushing Local repository..."
+        if [ -d ".git" ]; then
+            git add .
+            if git diff-index --quiet HEAD --; then
+                echo "No local changes detected."
+            else
+                MSG="Obsidian sync ($PROJECT_NAME): $(date +'%Y-%m-%d %H:%M:%S')"
+                git pull --rebase
+                git commit -m "$MSG"
+                echo "Pushing local changes..."
+                git push
+            fi
+        else
+            echo "Warning: .git directory not found in current directory. Skipping local commit."
+        fi
+
+        echo "Step 3: Committing and Pushing Obsidian repository..."
+        OBSIDIAN_REPO=$(dirname "$OBSIDIAN_BASE")
+        if [ -d "$OBSIDIAN_REPO/.git" ]; then
+            (
+                cd "$OBSIDIAN_REPO" || exit 1
+                git add .
+                if git diff-index --quiet HEAD --; then
+                    echo "No changes detected in Obsidian workspace."
+                else
+                    MSG="Obsidian sync ($PROJECT_NAME): $(date +'%Y-%m-%d %H:%M:%S')"
+                    git pull --rebase
+                    git commit -m "$MSG"
+                    echo "Pushing Obsidian workspace changes..."
+                    git push
+                fi
+            )
+        else
+            echo "Error: Obsidian repository .git not found at $OBSIDIAN_REPO"
+            exit 1
+        fi
+        ;;
+    *)
+        echo "Unknown command: $1"
+        echo
+        print_help
+        exit 1
+        ;;
+esac
