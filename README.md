@@ -36,7 +36,7 @@ brew install bash rsync git
 Clone the repo and symlink the script onto your `PATH`:
 
 ```sh
-git clone https://github.com/<user>/obsidian-sync.git ~/.local/share/obsidian-sync
+git clone https://github.com/trinhx/obsidian-sync.git ~/.local/share/obsidian-sync
 mkdir -p ~/.local/bin
 ln -s ~/.local/share/obsidian-sync/obsidian-sync ~/.local/bin/obsidian-sync
 ```
@@ -58,7 +58,7 @@ obsidian-sync help
 If you'd rather not symlink, you can also just run the script directly:
 
 ```sh
-git clone https://github.com/<user>/obsidian-sync.git
+git clone https://github.com/trinhx/obsidian-sync.git
 cd obsidian-sync
 ./obsidian-sync help
 ```

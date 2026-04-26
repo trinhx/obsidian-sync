@@ -14,11 +14,11 @@ USAGE
 
 COMMANDS
   init          Interactively create a .obsidian-sync config in the current
-                project. Lets you pick one or more source folders inside the
-                project (or the project root, or a custom path) and a
-                destination base inside the Obsidian vault. Each source maps
-                to <vault>/<dest_base>/<source>/. Creates destinations on
-                confirm.
+                project. Browse the project tree to pick one or more source
+                folders at any depth (or the project root, or a custom path)
+                and a destination base inside the Obsidian vault. Each source
+                maps to <vault>/<dest_base>/<source>/. Creates destinations
+                on confirm.
   status        Show differences for each configured source.
   pull          Sync Obsidian -> local for each source (rsync --delete).
   push          Sync local -> Obsidian for each source (rsync --delete).
@@ -138,6 +138,29 @@ build_paths() {
     OBSIDIAN_DIR=$(echo "$OBSIDIAN_BASE/${SYNC_DEST_BASE%/}/${src%/}/" | sed 's://*:/:g')
 }
 
+# List immediate subdirs of "./<rel>" (relative to PWD), sorted, dotdirs excluded.
+# Populates the global SUBDIRS array.
+list_subdirs() {
+    local rel="$1"
+    local dir="."
+    [ -n "$rel" ] && dir="./$rel"
+    SUBDIRS=()
+    local d
+    while IFS= read -r d; do
+        SUBDIRS+=("$d")
+    done < <(find "$dir" -maxdepth 1 -mindepth 1 -type d -not -name '.*' -printf '%f\n' 2>/dev/null | sort)
+}
+
+# Join a cursor path and a subdir name into a relative path (no leading/trailing slash).
+join_path() {
+    local cur="$1" sub="$2"
+    if [ -z "$cur" ]; then
+        printf '%s' "$sub"
+    else
+        printf '%s/%s' "${cur%/}" "$sub"
+    fi
+}
+
 do_init() {
     if [ -f ".obsidian-sync" ]; then
         echo "Error: .obsidian-sync already exists in this directory."
@@ -147,67 +170,109 @@ do_init() {
     local PROJECT_NAME
     PROJECT_NAME=$(basename "$PWD")
 
-    # --- Discover subdirs ---
-    local subdirs=()
-    local d
-    while IFS= read -r d; do
-        subdirs+=("$d")
-    done < <(find . -maxdepth 1 -mindepth 1 -type d -not -name '.*' -printf '%f\n' | sort)
-
-    # --- Pick SYNC_SRCS (multi-select) ---
+    # --- Pick SYNC_SRCS (browse + multi-select) ---
     echo
-    echo "Select folder(s) inside '$PROJECT_NAME' to sync:"
-    if [ "${#subdirs[@]}" -eq 0 ]; then
-        echo "  (no subdirectories found)"
-    else
-        local i=1
-        for d in "${subdirs[@]}"; do
-            printf "  %d) %s/\n" "$i" "$d"
-            i=$((i+1))
-        done
-    fi
-    echo
+    echo "Select folder(s) inside '$PROJECT_NAME' to sync. Drill into nested folders as needed."
 
+    local cursor=""
     local SYNC_SRCS=()
+    local SUBDIRS=()
+    local d input
+
     while true; do
-        local input
-        read -e -p "Numbers (e.g. 1,3), 'a' for all, 'r' for project root, 'c' for custom path, 'q' to cancel: " input
+        list_subdirs "$cursor"
+
+        echo
+        if [ -z "$cursor" ]; then
+            echo "Cursor:   ./"
+        else
+            echo "Cursor:   ./${cursor}/"
+        fi
+        if [ "${#SYNC_SRCS[@]}" -eq 0 ]; then
+            echo "Selected: (none)"
+        else
+            local s out=""
+            for s in "${SYNC_SRCS[@]}"; do
+                if [ -z "$s" ]; then
+                    out+=" (root)"
+                else
+                    out+=" $s"
+                fi
+            done
+            echo "Selected:${out}"
+        fi
+        echo
+
+        if [ "${#SUBDIRS[@]}" -eq 0 ]; then
+            echo "  (no subdirectories here)"
+        else
+            local i=1
+            for d in "${SUBDIRS[@]}"; do
+                printf "  %d) %s/\n" "$i" "$d"
+                i=$((i+1))
+            done
+        fi
+        echo
+
+        read -e -p "  [N] add  [N/] drill  [..] up  [.] add cursor  [a] add all  [r] root  [c] custom  [d] done  [q] quit: " input
         input="${input// /}"
+
         case "$input" in
+            "") continue ;;
             q|Q) echo "Aborted."; exit 1 ;;
-            r|R) SYNC_SRCS=(""); break ;;
-            a|A)
-                if [ "${#subdirs[@]}" -eq 0 ]; then
-                    echo "No subdirectories to select."
+            d|D)
+                if [ "${#SYNC_SRCS[@]}" -eq 0 ]; then
+                    echo "Pick at least one source first."
                     continue
                 fi
-                SYNC_SRCS=("${subdirs[@]}")
                 break
+                ;;
+            r|R) SYNC_SRCS=(""); break ;;
+            a|A)
+                if [ "${#SUBDIRS[@]}" -eq 0 ]; then
+                    echo "No subdirectories to add."
+                    continue
+                fi
+                for d in "${SUBDIRS[@]}"; do
+                    SYNC_SRCS+=("$(join_path "$cursor" "$d")")
+                done
+                ;;
+            ".")
+                SYNC_SRCS+=("$cursor")
+                ;;
+            "..")
+                if [ -z "$cursor" ]; then
+                    echo "Already at project root."
+                    continue
+                fi
+                if [[ "$cursor" == *"/"* ]]; then
+                    cursor="${cursor%/*}"
+                else
+                    cursor=""
+                fi
                 ;;
             c|C)
                 local custom
-                read -e -p "Custom path (relative to project root): " custom
-                SYNC_SRCS=("${custom%/}")
-                break
+                read -e -p "  Custom path (relative to project root): " custom
+                custom="${custom#./}"
+                custom="${custom%/}"
+                SYNC_SRCS+=("$custom")
                 ;;
-            "") echo "Please enter a selection." ;;
             *)
-                local invalid=0
-                local nums
-                IFS=',' read -ra nums <<< "$input"
-                local picked=()
-                local n
-                for n in "${nums[@]}"; do
-                    if ! [[ "$n" =~ ^[1-9][0-9]*$ ]] || [ "$n" -gt "${#subdirs[@]}" ]; then
-                        echo "Invalid: '$n'"
-                        invalid=1
-                        break
+                local drill=0 n="$input"
+                if [[ "$n" == */ ]]; then
+                    drill=1
+                    n="${n%/}"
+                fi
+                if [[ "$n" =~ ^[1-9][0-9]*$ ]] && [ "$n" -le "${#SUBDIRS[@]}" ]; then
+                    local sub="${SUBDIRS[$((n-1))]}"
+                    if [ "$drill" -eq 1 ]; then
+                        cursor="$(join_path "$cursor" "$sub")"
+                    else
+                        SYNC_SRCS+=("$(join_path "$cursor" "$sub")")
                     fi
-                    picked+=("${subdirs[$((n-1))]}")
-                done
-                if [ "$invalid" -eq 0 ] && [ "${#picked[@]}" -gt 0 ]; then
-                    SYNC_SRCS=("${picked[@]}")
-                    break
+                else
+                    echo "Invalid: '$input'"
                 fi
                 ;;
         esac
