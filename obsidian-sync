@@ -2,7 +2,7 @@
 
 # obsidian-sync — mirror project folders to/from an Obsidian vault.
 
-DEFAULT_OBSIDIAN_BASE="/home/max/Documents/Tonys Vault/Agent-Workspace/Projects"
+DEFAULT_OBSIDIAN_BASE="$HOME/Documents/ObsidianVault/Projects"
 CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/obsidian-sync/config"
 
 print_help() {
@@ -40,10 +40,10 @@ USER CONFIG  (~/.config/obsidian-sync/config)
                 Created on first run if missing — edit the file to change it.
 
 EXAMPLE
-  cd /home/max/Repos/honda-tune
-  obsidian-sync init           # pick "1,2" (drive + tunes), accept default base
-  obsidian-sync push           # mirrors honda-tune/drive/  -> <vault>/honda-tune/drive/
-                               # mirrors honda-tune/tunes/  -> <vault>/honda-tune/tunes/
+  cd ~/Repos/my-project
+  obsidian-sync init           # pick "1,2" (notes + drafts), accept default base
+  obsidian-sync push           # mirrors my-project/notes/   -> <vault>/my-project/notes/
+                               # mirrors my-project/drafts/  -> <vault>/my-project/drafts/
 EOF
 }
 
