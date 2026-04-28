@@ -119,6 +119,22 @@ Each entry maps `./<src>/` ↔ `<OBSIDIAN_BASE>/<SYNC_DEST_BASE>/<src>/`.
 
 Commit `.obsidian-sync` to your repo if you want the same layout on every machine — paths inside it are relative to the project root and the vault base, so there's nothing host-specific in it.
 
+### Ignore file (`./.obsidian-sync-ignore`)
+
+Optional. Create this file in your project root to exclude files and directories from syncing:
+
+```
+# one rsync-style pattern per line
+*.log
+node_modules/
+.env
+build/
+```
+
+- All sync commands (`push`, `pull`, `git-pull`, `git-commit`) respect the ignore file.
+- `pull` with `--delete` will **not** delete ignored local files, even if they are absent from the vault.
+- `status` shows ignored local files in a separate `[ignored]` section so you can see what is being skipped.
+
 ### Global (`~/.config/obsidian-sync/config`)
 
 ```sh
