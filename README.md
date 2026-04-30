@@ -95,6 +95,7 @@ On first run, `obsidian-sync` scans `$HOME` for Obsidian vaults (directories con
 | Command  | Description                                                                   |
 | -------- | ----------------------------------------------------------------------------- |
 | `init`   | Interactively create a `.obsidian-sync` config in the current project.        |
+| `add`    | Add one or more source folders to an existing config using the same browser.  |
 | `status` | Show `diff -rq` between local and vault for each configured source.           |
 | `pull`       | Sync vault → local (`rsync --delete`).                                        |
 | `git-pull`   | `git pull` the vault repo, then sync vault → local. Use this instead of `pull` when your vault is a git repo synced across machines. |

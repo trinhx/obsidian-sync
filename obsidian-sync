@@ -19,6 +19,8 @@ COMMANDS
                 and a destination base inside the Obsidian vault. Each source
                 maps to <vault>/<dest_base>/<source>/. Creates destinations
                 on confirm.
+  add           Add one or more source folders to an existing .obsidian-sync
+                config using the same interactive browser as init.
   status        Show differences for each configured source.
   pull          Sync Obsidian -> local for each source (rsync --delete).
   git-pull      git pull the Obsidian vault repo, then sync vault -> local.
@@ -199,21 +201,15 @@ show_ignored_files() {
     fi
 }
 
-do_init() {
-    if [ -f ".obsidian-sync" ]; then
-        echo "Error: .obsidian-sync already exists in this directory."
-        exit 1
-    fi
-
-    local PROJECT_NAME
-    PROJECT_NAME=$(basename "$PWD")
-
-    # --- Pick SYNC_SRCS (browse + multi-select) ---
+# Interactively browse the project tree and pick source folders.
+# Populates the global PICKED_SRCS array.
+run_picker() {
+    local label="${1:-$(basename "$PWD")}"
     echo
-    echo "Select folder(s) inside '$PROJECT_NAME' to sync. Drill into nested folders as needed."
+    echo "Select folder(s) inside '$label' to sync. Drill into nested folders as needed."
 
     local cursor=""
-    local SYNC_SRCS=()
+    PICKED_SRCS=()
     local SUBDIRS=()
     local d input
 
@@ -226,11 +222,11 @@ do_init() {
         else
             echo "Cursor:   ./${cursor}/"
         fi
-        if [ "${#SYNC_SRCS[@]}" -eq 0 ]; then
+        if [ "${#PICKED_SRCS[@]}" -eq 0 ]; then
             echo "Selected: (none)"
         else
             local s out=""
-            for s in "${SYNC_SRCS[@]}"; do
+            for s in "${PICKED_SRCS[@]}"; do
                 if [ -z "$s" ]; then
                     out+=" (root)"
                 else
@@ -259,24 +255,24 @@ do_init() {
             "") continue ;;
             q|Q) echo "Aborted."; exit 1 ;;
             d|D)
-                if [ "${#SYNC_SRCS[@]}" -eq 0 ]; then
+                if [ "${#PICKED_SRCS[@]}" -eq 0 ]; then
                     echo "Pick at least one source first."
                     continue
                 fi
                 break
                 ;;
-            r|R) SYNC_SRCS=(""); break ;;
+            r|R) PICKED_SRCS=(""); break ;;
             a|A)
                 if [ "${#SUBDIRS[@]}" -eq 0 ]; then
                     echo "No subdirectories to add."
                     continue
                 fi
                 for d in "${SUBDIRS[@]}"; do
-                    SYNC_SRCS+=("$(join_path "$cursor" "$d")")
+                    PICKED_SRCS+=("$(join_path "$cursor" "$d")")
                 done
                 ;;
             ".")
-                SYNC_SRCS+=("$cursor")
+                PICKED_SRCS+=("$cursor")
                 ;;
             "..")
                 if [ -z "$cursor" ]; then
@@ -294,7 +290,7 @@ do_init() {
                 read -e -p "  Custom path (relative to project root): " custom
                 custom="${custom#./}"
                 custom="${custom%/}"
-                SYNC_SRCS+=("$custom")
+                PICKED_SRCS+=("$custom")
                 ;;
             *)
                 local drill=0 n="$input"
@@ -307,7 +303,7 @@ do_init() {
                     if [ "$drill" -eq 1 ]; then
                         cursor="$(join_path "$cursor" "$sub")"
                     else
-                        SYNC_SRCS+=("$(join_path "$cursor" "$sub")")
+                        PICKED_SRCS+=("$(join_path "$cursor" "$sub")")
                     fi
                 else
                     echo "Invalid: '$input'"
@@ -315,6 +311,44 @@ do_init() {
                 ;;
         esac
     done
+}
+
+# Write SYNC_SRCS + SYNC_DEST_BASE to .obsidian-sync.
+write_project_config() {
+    local dest_base="$1"
+    shift
+    local srcs=("$@")
+    {
+        echo "# obsidian-sync project config — generated $(date +'%Y-%m-%d')"
+        echo
+        echo "# Source folders to sync (relative to project root)."
+        echo "# An empty-string entry means the project root itself."
+        printf 'SYNC_SRCS=('
+        local first=1 src
+        for src in "${srcs[@]}"; do
+            if [ $first -eq 1 ]; then first=0; else printf ' '; fi
+            printf '%q' "$src"
+        done
+        printf ')\n'
+        echo
+        echo "# Destination base in the Obsidian vault (relative to OBSIDIAN_BASE)."
+        echo "# Each SYNC_SRCS entry maps to <OBSIDIAN_BASE>/<SYNC_DEST_BASE>/<src>/"
+        printf 'SYNC_DEST_BASE=%q\n' "$dest_base"
+    } > .obsidian-sync
+}
+
+do_init() {
+    if [ -f ".obsidian-sync" ]; then
+        echo "Error: .obsidian-sync already exists. Use 'obsidian-sync add' to add more sources."
+        exit 1
+    fi
+
+    local PROJECT_NAME
+    PROJECT_NAME=$(basename "$PWD")
+
+    # --- Pick SYNC_SRCS ---
+    run_picker "$PROJECT_NAME"
+    local SYNC_SRCS=("${PICKED_SRCS[@]}")
 
     # --- Pick SYNC_DEST_BASE ---
     echo
@@ -348,25 +382,71 @@ do_init() {
         mkdir -p "$OBSIDIAN_DIR"
     done
 
-    {
-        echo "# obsidian-sync project config — generated $(date +'%Y-%m-%d')"
-        echo
-        echo "# Source folders to sync (relative to project root)."
-        echo "# An empty-string entry means the project root itself."
-        printf 'SYNC_SRCS=('
-        local first=1
-        for src in "${SYNC_SRCS[@]}"; do
-            if [ $first -eq 1 ]; then first=0; else printf ' '; fi
-            printf '%q' "$src"
-        done
-        printf ')\n'
-        echo
-        echo "# Destination base in the Obsidian vault (relative to OBSIDIAN_BASE)."
-        echo "# Each SYNC_SRCS entry maps to <OBSIDIAN_BASE>/<SYNC_DEST_BASE>/<src>/"
-        printf 'SYNC_DEST_BASE=%q\n' "$SYNC_DEST_BASE"
-    } > .obsidian-sync
-
+    write_project_config "$SYNC_DEST_BASE" "${SYNC_SRCS[@]}"
     echo "Wrote .obsidian-sync. Try: obsidian-sync push"
+}
+
+do_add() {
+    if [ ! -f ".obsidian-sync" ]; then
+        echo "Error: No .obsidian-sync found. Run 'obsidian-sync init' first."
+        exit 1
+    fi
+
+    # shellcheck disable=SC1091
+    source .obsidian-sync
+
+    local PROJECT_NAME
+    PROJECT_NAME=$(basename "$PWD")
+
+    echo "Current sources:"
+    local s
+    for s in "${SYNC_SRCS[@]}"; do
+        echo "  ${s:-(root)}"
+    done
+
+    run_picker "$PROJECT_NAME"
+
+    # Merge new picks into SYNC_SRCS, skipping duplicates
+    local new_src added=0
+    for new_src in "${PICKED_SRCS[@]}"; do
+        local dup=0 existing
+        for existing in "${SYNC_SRCS[@]}"; do
+            [ "$existing" = "$new_src" ] && dup=1 && break
+        done
+        if [ "$dup" -eq 1 ]; then
+            echo "Skipping '${new_src:-(root)}' — already in SYNC_SRCS."
+        else
+            SYNC_SRCS+=("$new_src")
+            added=$((added+1))
+        fi
+    done
+
+    if [ "$added" -eq 0 ]; then
+        echo "No new sources added."
+        exit 0
+    fi
+
+    echo
+    echo "New vault destinations:"
+    for new_src in "${PICKED_SRCS[@]}"; do
+        build_paths "$new_src"
+        echo "  $LOCAL_DIR"
+        echo "    -> $OBSIDIAN_DIR"
+    done
+    echo
+    local yn
+    read -p "Proceed? [Y/n] " yn
+    case "$yn" in
+        [Nn]*) echo "Aborted."; exit 1 ;;
+    esac
+
+    for new_src in "${PICKED_SRCS[@]}"; do
+        build_paths "$new_src"
+        mkdir -p "$OBSIDIAN_DIR"
+    done
+
+    write_project_config "$SYNC_DEST_BASE" "${SYNC_SRCS[@]}"
+    echo "Updated .obsidian-sync (+${added} source(s)). Try: obsidian-sync push"
 }
 
 # --- Dispatch ---
@@ -387,6 +467,11 @@ load_config
 
 if [ "$1" == "init" ]; then
     do_init
+    exit 0
+fi
+
+if [ "$1" == "add" ]; then
+    do_add
     exit 0
 fi
 
